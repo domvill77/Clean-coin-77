@@ -1,0 +1,317 @@
+# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
+# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+
+name: Node.js Package
+
+on:
+  release:
+    types: [created]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci
+      - run: npm test
+
+  publish-gpr:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://npm.pkg.github.com/
+      - run: npm ci
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+import os, json, textwrap, zipfile, shutil, pathlib
+
+base = "/mnt/data/RES_Labs_Project"
+if os.path.exists(base):
+    shutil.rmtree(base)
+os.makedirs(base, exist_ok=True)
+
+# Directories
+for d in [".github/workflows","contracts","scripts","src/middleware","src/server","logs","docs","LICENSES"]:
+    os.makedirs(os.path.join(base, d), exist_ok=True)
+
+# package.json
+package_json = {
+  "name": "res-labs-security-layer",
+  "version": "1.0.0",
+  "private": True,
+  "type": "module",
+  "scripts": {
+    "dev": "node src/server/server.js",
+    "start": "node src/server/server.js",
+    "deploy:securityproof": "hardhat run scripts/deploy_securityproof.js --network ${NETWORK:-sepolia}",
+    "anchor:today": "node scripts/anchor_logs.js --today",
+    "anchor:file": "node scripts/anchor_logs.js --file",
+    "format": "prettier --write ."
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.2",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.22.15",
+    "prettier": "^3.3.3"
+  }
+}
+open(os.path.join(base, "package.json"), "w").write(json.dumps(package_json, indent=2))
+
+# .env.example
+env_example = """# ================== RES Labs Security Layer ==================
+# Public branding:
+# Founder: Bronzv
+# Internal Founder: Dominic D. Villanueva (Bronzv)
+
+# -------- Hardhat / Deployment --------
+RPC_URL=
+PRIVATE_KEY=
+NETWORK=sepolia
+
+# Optional explorer API (for verify step if you add it)
+ETHERSCAN_API_KEY=
+
+# After deploying SecurityProof.sol, paste the address here
+SECURITY_PROOF_ADDRESS=
+
+# -------- R.E.S. Server --------
+PORT=8080
+TRUST_PROXY=true
+LOG_DIR=./logs
+RATE_LIMIT_WINDOW_MS=60000
+RATE_LIMIT_MAX=120
+BLOCK_PRIVATE_IP=false
+
+# Cron (anchors daily at 00:10 UTC when true)
+ANCHOR_CRON_ENABLED=true
+"""
+open(os.path.join(base, ".env.example"), "w").write(env_example)
+
+# gitignore
+open(os.path.join(base, ".gitignore"), "w").write("node_modules\n.env\nlogs/*.jsonl\nlogs/last_anchor.json\ncoverage\ncache\nartifacts\n")
+
+# hardhat
+hardhat_cfg = """import { config as dotenv } from "dotenv";
+dotenv();
+import "@nomicfoundation/hardhat-toolbox";
+const RPC_URL = process.env.RPC_URL || "";
+const PRIVATE_KEY = process.env.PRIVATE_KEY || "";
+export default {
+  solidity: "0.8.24",
+  networks: {
+    sepolia: { url: RPC_URL, accounts: PRIVATE_KEY ? [PRIVATE_KEY] : [] }
+  }
+};"""
+open(os.path.join(base, "hardhat.config.js"), "w").write(hardhat_cfg)
+
+# contract
+securityproof = """// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+contract SecurityProof {
+    struct Entry { bytes32 hash; string meta; uint256 timestamp; }
+    address public owner;
+    mapping(bytes32 => Entry) public entries;
+    event Anchored(bytes32 indexed hash, string meta, uint256 timestamp);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    modifier onlyOwner() { require(msg.sender == owner, "Not owner"); _; }
+    constructor(address owner_) { owner = owner_; emit OwnershipTransferred(address(0), owner_); }
+    function transferOwnership(address newOwner) external onlyOwner { require(newOwner != address(0), "Zero owner"); emit OwnershipTransferred(owner, newOwner); owner = newOwner; }
+    function anchor(bytes32 hash_, string calldata meta_) external onlyOwner {
+        require(hash_ != bytes32(0), "Invalid hash");
+        require(entries[hash_].timestamp == 0, "Already anchored");
+        entries[hash_] = Entry({hash: hash_, meta: meta_, timestamp: block.timestamp});
+        emit Anchored(hash_, meta_, block.timestamp);
+    }
+}"""
+open(os.path.join(base, "contracts", "SecurityProof.sol"), "w").write(securityproof)
+
+# scripts
+deploy_js = """import { ethers } from "hardhat";
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying with:", deployer.address);
+  const SecurityProof = await ethers.getContractFactory("SecurityProof");
+  const contract = await SecurityProof.deploy(deployer.address);
+  await contract.waitForDeployment();
+  const addr = await contract.getAddress();
+  console.log("SecurityProof deployed at:", addr);
+  console.log("Set SECURITY_PROOF_ADDRESS in your .env to:", addr);
+}
+main().catch((e) => { console.error(e); process.exit(1); });"""
+open(os.path.join(base, "scripts", "deploy_securityproof.js"), "w").write(deploy_js)
+
+anchor_js = """import fs from "fs"; import path from "path"; import crypto from "crypto"; import dotenv from "dotenv"; import { ethers } from "ethers";
+dotenv.config();
+const LOG_DIR = process.env.LOG_DIR || "./logs";
+const PROJECT_TAG = "RES-Labs";
+const RPC_URL = process.env.RPC_URL;
+const PRIVATE_KEY = process.env.PRIVATE_KEY;
+const SECURITY_PROOF_ADDRESS = process.env.SECURITY_PROOF_ADDRESS;
+function today(){return new Date().toISOString().slice(0,10);} function logPath(date){return path.join(LOG_DIR, `res-${date}.jsonl`);} function sha256Hex(buf){return "0x"+crypto.createHash("sha256").update(buf).digest("hex");}
+async function anchor(filePath){
+  const buf = fs.existsSync(filePath) ? fs.readFileSync(filePath) : Buffer.from("");
+  const hash = sha256Hex(buf); const meta = `${PROJECT_TAG}-${path.basename(filePath)}`;
+  if(!RPC_URL||!PRIVATE_KEY||!SECURITY_PROOF_ADDRESS) throw new Error("Missing RPC_URL / PRIVATE_KEY / SECURITY_PROOF_ADDRESS in .env");
+  const provider = new ethers.JsonRpcProvider(RPC_URL);
+  const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
+  const abi = ["function anchor(bytes32 hash_, string meta_) external"];
+  const contract = new ethers.Contract(SECURITY_PROOF_ADDRESS, abi, wallet);
+  const tx = await contract.anchor(hash, meta); const rc = await tx.wait();
+  const out = { file:filePath, sha256:hash, meta, txHash: rc.hash, ts: new Date().toISOString() };
+  fs.writeFileSync(path.join(LOG_DIR,"last_anchor.json"), JSON.stringify(out,null,2));
+  console.log("Anchored:", out); return out;
+}
+async function main(){
+  const args = process.argv.slice(2); let target;
+  if(args.includes("--today")) target = logPath(today());
+  else { const idx = args.indexOf("--file"); if(idx>=0 && args[idx+1]) target=args[idx+1]; }
+  if(!target){ console.error("Usage: node scripts/anchor_logs.js --today | --file <path>"); process.exit(1); }
+  await anchor(target);
+}
+main().catch(e=>{ console.error(e); process.exit(1); });"""
+open(os.path.join(base, "scripts", "anchor_logs.js"), "w").write(anchor_js)
+
+# middleware
+res_mw = """import fs from "fs"; import path from "path";
+const WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "60000", 10);
+const MAX_REQ = parseInt(process.env.RATE_LIMIT_MAX || "120", 10);
+const LOG_DIR = process.env.LOG_DIR || "./logs"; fs.mkdirSync(LOG_DIR, { recursive: true }); const buckets = new Map();
+function now(){return Date.now();} function today(){return new Date().toISOString().slice(0,10);} function dailyLogPath(){return path.join(LOG_DIR, `res-${today()}.jsonl`);}
+function writeLog(obj){ try{ fs.appendFileSync(dailyLogPath(), JSON.stringify(obj) + "\\n"); }catch{} }
+function getClientIp(req){ const h = req.headers["cf-connecting-ip"] || req.headers["x-forwarded-for"]; if(h && typeof h === "string") return h.split(",")[0].trim(); return req.ip || req.connection?.remoteAddress || "unknown"; }
+function isPrivateIP(ip){ return /^10\\.|^192\\.168\\.|^172\\.(1[6-9]|2\\d|3[0-1])\\.|^127\\.|^::1/.test(ip); }
+function suspicious(req){ const ua=(req.headers["user-agent"]||"").toLowerCase(); const url=req.originalUrl||req.url||""; if(/\\.(php|asp|aspx|jsp)$/i.test(url)) return "forbidden_extension_scan"; if(url.includes("..")||url.includes("%2e%2e")) return "path_traversal"; if(ua.includes("sqlmap")||ua.includes("nikto")||ua.includes("acunetix")) return "scanner_ua"; if(req.method==="POST"&&(req.headers["content-type"]||"").includes("text/plain")) return "suspicious_post_plain"; return null; }
+export function resLayer(){ return function(req,res,next){ const ip=getClientIp(req); const ua=req.headers["user-agent"]||""; const meta={ ts:new Date().toISOString(), ip, ua, method:req.method, url:req.originalUrl||req.url, ref:req.headers["referer"]||"", suspicious:null, action:"allow" };
+  if((process.env.BLOCK_PRIVATE_IP||"false").toLowerCase()==="true" && isPrivateIP(ip)){ meta.suspicious="private_ip_block"; meta.action="block"; writeLog(meta); return res.status(403).json({ error:"Forbidden" }); }
+  const b=buckets.get(ip)||{count:0, resetAt: now()+WINDOW_MS}; if(now()>b.resetAt){ b.count=0; b.resetAt=now()+WINDOW_MS; } b.count+=1; buckets.set(ip,b);
+  if(b.count>MAX_REQ){ meta.suspicious="rate_limit_exceeded"; meta.action="throttle"; writeLog(meta); return res.status(429).json({ error:"Too Many Requests" }); }
+  const flag=suspicious(req); if(flag){ meta.suspicious=flag; meta.action="flag"; writeLog(meta); } else { writeLog(meta); } next(); }; }"""
+open(os.path.join(base, "src/middleware", "resLayer.js"), "w").write(res_mw)
+
+# server
+server_js = """import express from "express"; import morgan from "morgan"; import dotenv from "dotenv"; import path from "path"; import { fileURLToPath } from "url"; import cron from "node-cron"; import { resLayer } from "../middleware/resLayer.js"; import fs from "fs"; import crypto from "crypto";
+dotenv.config(); const __filename=fileURLToPath(import.meta.url); const __dirname=path.dirname(__filename);
+const app = express(); if((process.env.TRUST_PROXY||"true").toLowerCase()==="true") app.set("trust proxy", true);
+app.use(express.json({ limit:"256kb" })); app.use(morgan(":method :url :status - :response-time ms")); app.use(resLayer());
+app.get("/res/health", (_req,res)=>res.json({ ok:true, ts:new Date().toISOString() }));
+app.get("/res/hash/today", (_req,res)=>{ const LOG_DIR=process.env.LOG_DIR||"./logs"; const p=path.join(LOG_DIR, `res-${new Date().toISOString().slice(0,10)}.jsonl`); try{ const buf=fs.existsSync(p)?fs.readFileSync(p):Buffer.from(""); const sha256="0x"+crypto.createHash("sha256").update(buf).digest("hex"); res.json({ file:path.basename(p), sha256 }); }catch(e){ res.status(500).json({ error:String(e) }); } });
+app.get("/api/example", (_req,res)=>res.json({ hello:"world" }));
+const PORT=process.env.PORT||8080; app.listen(PORT, ()=>console.log(`R.E.S. server on :${PORT}`));
+if((process.env.ANCHOR_CRON_ENABLED||"true").toLowerCase()==="true"){ cron.schedule("10 0 * * *", async ()=>{ try{ const { spawn } = await import("child_process"); const proc=spawn("node", ["scripts/anchor_logs.js","--today"], { cwd: path.join(__dirname,"..","..") }); proc.stdout.on("data", d=>process.stdout.write(d)); proc.stderr.on("data", d=>process.stderr.write(d)); }catch(e){ console.error("Cron anchor failed:", e); } }, { timezone:"UTC" }); }"""
+open(os.path.join(base, "src/server", "server.js"), "w").write(server_js)
+
+# docs
+open(os.path.join(base, "docs", "RES_TECH_OVERVIEW.md"), "w").write("# R.E.S. Security Layer — Overview\n")
+open(os.path.join(base, "docs", "BUSINESS_MODEL_CANVAS.md"), "w").write("# Business Model Canvas\n")
+
+# Dockerfile, Procfile, PM2
+open(os.path.join(base, "Dockerfile"), "w").write("FROM node:18-alpine\nWORKDIR /app\nCOPY package.json package-lock.json* ./\nRUN npm install --production || npm install --production\nCOPY . .\nENV PORT=8080\nEXPOSE 8080\nCMD [\"node\",\"src/server/server.js\"]\n")
+open(os.path.join(base, "Procfile"), "w").write("web: node src/server/server.js\n")
+open(os.path.join(base, "ecosystem.config.cjs"), "w").write('export default { apps:[{ name:"res-security", script:"src/server/server.js"}] }\n')
+
+# GHA workflow
+gha = """name: RES • Nightly Anchor
+on:
+  schedule:
+    - cron: "15 0 * * *"
+  workflow_dispatch:
+
+jobs:
+  anchor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 18 }
+      - run: npm install
+      - run: npx hardhat compile
+      - run: node scripts/anchor_logs.js --today
+        env:
+          RPC_URL: ${{ secrets.RPC_URL }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+          SECURITY_PROOF_ADDRESS: ${{ secrets.SECURITY_PROOF_ADDRESS }}
+          LOG_DIR: logs
+      - uses: actions/upload-artifact@v4
+        with: { name: RES_logs_and_anchor, path: "logs/**" }
+"""
+open(os.path.join(base, ".github/workflows", "res-anchor.yml"), "w").write(gha)
+
+# README
+readme = """# R.E.S. Labs — Security Layer (Standalone Project)
+
+**Founder (Public): Bronzv**  
+**Internal Founder: Dominic D. Villanueva (Bronzv)**
+
+- Express middleware for intrusion detection + logging.
+- On-chain log integrity anchoring via `SecurityProof.sol`.
+- Nightly GitHub Action to anchor logs.
+- Docker/Procfile/PM2 for deployment.
+
+## Quick Start
+```
+npm install
+cp .env.example .env
+npx hardhat compile
+npx hardhat run scripts/deploy_securityproof.js --network sepolia
+# Put address into SECURITY_PROOF_ADDRESS in .env
+npm run dev
+```
+---
+## Licensing Options
+This repository ships with a License Pack under `/LICENSES` (Apache-2.0 default in root LICENSE).
+"""
+open(os.path.join(base, "README.md"), "w").write(readme)
+
+# SECURITY and NOTICE and LICENSES
+
+apache = """Apache License Version 2.0, January 2004
+Copyright 2025 Dominic D. Villanueva (bronzv)
+http://www.apache.org/licenses/"""
+mit = """MIT License
+Copyright (c) 2025 Dominic D. Villanueva (bronzv)"""
+bsd3 = "BSD 3-Clause License\nCopyright (c) 2025"
+gpl3 = "GNU GPL v3 — see https://www.gnu.org/licenses/gpl-3.0.txt"
+agpl3 = "GNU AGPL v3 — see https://www.gnu.org/licenses/agpl-3.0.txt"
+lgpl3 = "GNU LGPL v3 — see https://www.gnu.org/licenses/lgpl-3.0.txt"
+
+open(os.path.join(base, "LICENSES", "LICENSE_APACHE.md"), "w").write(apache)
+open(os.path.join(base, "LICENSES", "LICENSE_MIT.md"), "w").write(mit)
+open(os.path.join(base, "LICENSES", "LICENSE_BSD-3.md"), "w").write(bsd3)
+open(os.path.join(base, "LICENSES", "LICENSE_GPL-3.0.md"), "w").write(gpl3)
+open(os.path.join(base, "LICENSES", "LICENSE_AGPL-3.0.md"), "w").write(agpl3)
+open(os.path.join(base, "LICENSES", "LICENSE_LGPL-3.0.md"), "w").write(lgpl3)
+open(os.path.join(base, "LICENSE"), "w").write(apache)
+
+notice = "R.E.S. Security Layer™ — Trademarks claimed by Dominic D. Villanueva (bronzv)."
+open(os.path.join(base, "NOTICE"), "w").write(notice)
+
+security_md = "# Security Policy — report to security@res-labs.example (replace)."
+open(os.path.join(base, "SECURITY.md"), "w").write(security_md)
+
+# Zip
+zip_path = "/mnt/data/RES_Labs_Security_Layer_v3_WITH_LICENSE_PACK.zip"
+with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
+    for root, _, files in os.walk(base):
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, base)
+            z.write(full, arcname=rel)
+
+zip_path
